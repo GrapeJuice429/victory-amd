@@ -9256,8 +9256,10 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            if p.swap_chain.Present(0, DXGI_PRESENT(0)).0 == 0 {
-                tracing::debug!(target: "victory_present", frame, "presented");
+            let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            static LOG_PRESENTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if result.0 == 0 && *LOG_PRESENTS.get_or_init(|| std::env::var("VICTORY_PRESENT_TIMING").as_deref() == Ok("1")) {
+                tracing::info!(target: "victory_present", frame, "presented");
             }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
