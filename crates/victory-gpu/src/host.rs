@@ -9256,7 +9256,9 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if p.swap_chain.Present(0, DXGI_PRESENT(0)).0 == 0 {
+                tracing::debug!(target: "victory_present", frame, "presented");
+            }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
