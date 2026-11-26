@@ -1,21 +1,22 @@
 //! Optional desktop controls on the keyboard's existing stand-in pad.
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F6;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F6, VK_F7};
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT,
     RIDEV_CAPTUREMOUSE, RIDEV_NOLEGACY, RIDEV_REMOVE, RIM_TYPEMOUSE, RegisterRawInputDevices,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, GetForegroundWindow};
 
-use super::{A, KeyState, LEFT_STICK, PadState, X, Y, fallback, merged};
+use super::{KeyState, PadState, keyboard_layout, merged};
 
 static CAPTURED: AtomicUsize = AtomicUsize::new(0);
+static DRIVING: AtomicBool = AtomicBool::new(false);
 
-pub(super) fn enabled() -> bool {
+pub(in crate::modules) fn enabled() -> bool {
     static ENABLED: LazyLock<bool> =
         LazyLock::new(|| std::env::var_os("VICTORY_PC_CONTROLS").is_some_and(|s| s == "1"));
     *ENABLED
@@ -26,19 +27,29 @@ fn captured(hwnd: HWND) -> bool {
 }
 
 pub(super) fn pad(keys: &[KeyState], mouse: PadState) -> PadState {
-    let mut pad = fallback(keys);
-    // In PC mode F enters a vehicle; Ctrl takes over the stick click.
-    pad.buttons &= !LEFT_STICK;
+    let mut keyboard = keyboard_layout(keys, true);
+    if DRIVING.load(Ordering::Relaxed) {
+        driving_keys(keys, &mut keyboard);
+    }
+    merged(keyboard, mouse)
+}
+
+// GameInput exposes controller readings and has no on-foot/vehicle context.
+fn driving_keys(keys: &[KeyState], pad: &mut PadState) {
+    pad.left_y = 0.0;
+    pad.buttons = 0;
     for key in keys {
+        pad.buttons |= if key.virtual_key == 0x20 {
+            super::RIGHT_SHOULDER // Space: handbrake
+        } else {
+            super::key_button(key.virtual_key, true)
+        };
         match key.virtual_key {
-            b'F' => pad.buttons |= Y,
-            0x20 => pad.buttons |= X,                 // Space
-            0xa0 | 0xa1 => pad.buttons |= A,          // Left/right Shift
-            0xa2 | 0xa3 => pad.buttons |= LEFT_STICK, // Left/right Ctrl
+            b'W' => pad.right_trigger = 1.0,
+            b'S' => pad.left_trigger = 1.0,
             _ => {}
         }
     }
-    merged(pad, mouse)
 }
 
 #[derive(Default)]
@@ -48,6 +59,7 @@ struct Motion {
     left: bool,
     right: bool,
     last_poll: Option<Instant>,
+    suppressed: bool,
     absolute: Option<(usize, bool, i32, i32)>,
     previous_cursor: usize,
 }
@@ -106,15 +118,25 @@ impl Motion {
         }
     }
 
-    fn sample(&mut self, now: Instant) -> PadState {
+    fn sample(&mut self, now: Instant, available: bool) -> PadState {
         let previous = self.last_poll.replace(now).unwrap_or(now);
-        let (right_x, right_y) = stick(
-            self.dx,
-            self.dy.saturating_neg(),
-            now.duration_since(previous).as_secs_f32(),
-        );
-        self.dx = 0;
-        self.dy = 0;
+        let dx = std::mem::take(&mut self.dx);
+        let dy = std::mem::take(&mut self.dy);
+        // With separate host pads the stand-in temporarily disappears. Drop the
+        // partial interval spanning its return too, so a disconnect cannot replay motion.
+        let was_suppressed = std::mem::replace(&mut self.suppressed, !available);
+        if !available {
+            return PadState::default();
+        }
+        let (right_x, right_y) = if was_suppressed {
+            (0.0, 0.0)
+        } else {
+            stick(
+                dx,
+                dy.saturating_neg(),
+                now.duration_since(previous).as_secs_f32(),
+            )
+        };
         PadState {
             right_x,
             right_y,
@@ -125,9 +147,9 @@ impl Motion {
     }
 }
 
-pub(super) fn mouse_pad(hwnd: HWND) -> PadState {
+pub(super) fn mouse_pad(hwnd: HWND, available: bool) -> PadState {
     if captured(hwnd) {
-        super::lock(&MOTION).sample(Instant::now())
+        super::lock(&MOTION).sample(Instant::now(), available)
     } else {
         PadState::default()
     }
@@ -154,6 +176,18 @@ fn release() {
     tracing::info!("PC mouse released");
 }
 
+fn capture(hwnd: HWND) {
+    if register(hwnd, RIDEV_NOLEGACY | RIDEV_CAPTUREMOUSE) {
+        // SAFETY: this thread owns the game's window and cursor.
+        let previous_cursor = unsafe { wm::SetCursor(std::ptr::null_mut()) } as usize;
+        *super::lock(&MOTION) = Motion { previous_cursor, ..Motion::default() };
+        CAPTURED.store(hwnd as usize, Ordering::Relaxed);
+        tracing::info!("PC mouse captured");
+    } else {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "could not register PC mouse");
+    }
+}
+
 pub(in crate::modules) fn window_message(
     hwnd: HWND,
     message: u32,
@@ -164,24 +198,25 @@ pub(in crate::modules) fn window_message(
         return None;
     }
     match message {
+        wm::WM_SETFOCUS | wm::WM_LBUTTONDOWN if !captured(hwnd) => {
+            // A click can acquire the game's window after the title installs its procedure.
+            if unsafe { GetForegroundWindow() } == hwnd {
+                capture(hwnd);
+            }
+            None
+        }
+        wm::WM_KEYDOWN if wparam == usize::from(VK_F7) && lparam & (1 << 30) == 0 => {
+            let driving = !DRIVING.fetch_xor(true, Ordering::Relaxed);
+            tracing::info!(driving, "PC driving layout");
+            Some(0)
+        }
         wm::WM_KEYDOWN if wparam == usize::from(VK_F6) && lparam & (1 << 30) == 0 => {
             // SAFETY: read-only query of the foreground window.
             let foreground = unsafe { GetForegroundWindow() };
             if captured(hwnd) {
                 release();
             } else if foreground == hwnd {
-                if register(hwnd, RIDEV_NOLEGACY | RIDEV_CAPTUREMOUSE) {
-                    // SAFETY: this thread owns the game's window and cursor.
-                    let previous_cursor = unsafe { wm::SetCursor(std::ptr::null_mut()) } as usize;
-                    *super::lock(&MOTION) = Motion {
-                        previous_cursor,
-                        ..Motion::default()
-                    };
-                    CAPTURED.store(hwnd as usize, Ordering::Relaxed);
-                    tracing::info!("PC mouse captured");
-                } else {
-                    tracing::warn!(error = %std::io::Error::last_os_error(), "could not register PC mouse");
-                }
+                capture(hwnd);
             }
             Some(0)
         }
@@ -249,7 +284,46 @@ fn stick(dx: i32, dy: i32, seconds: f32) -> (f32, f32) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{A, LEFT_STICK, X, Y, key_button};
     use super::*;
+
+    #[test]
+    fn desktop_actions_and_vehicle_pedals() {
+        use super::super::{B, LEFT_SHOULDER, RIGHT, RIGHT_SHOULDER, VIEW};
+        for (vk, expected) in [(b'E', RIGHT), (b'R', B), (b'Q', RIGHT_SHOULDER),
+                               (0x09, LEFT_SHOULDER), (b'V', VIEW)] {
+            assert_eq!(key_button(vk, true), expected);
+        }
+        let key = |vk| KeyState { virtual_key: vk, ..Default::default() };
+        for (vk, left, right) in [(b'W', 0.0, 1.0), (b'S', 1.0, 0.0)] {
+            let keys = [key(vk), key(b'A'), key(0x20)];
+            let mut pad = keyboard_layout(&keys, true);
+            assert_ne!(pad.left_y, 0.0);
+            assert_eq!((pad.left_trigger, pad.right_trigger), (0.0, 0.0));
+            driving_keys(&keys, &mut pad);
+            assert_eq!(pad.buttons, RIGHT_SHOULDER);
+            assert_eq!((pad.left_x, pad.left_y, pad.left_trigger, pad.right_trigger),
+                       (-1.0, 0.0, left, right));
+        }
+        let crouch = keyboard_layout(&[key(b'C')], true);
+        assert_eq!((crouch.buttons, crouch.right_trigger), (LEFT_STICK, 0.0));
+    }
+
+    #[test]
+    fn scripted_f_on_a_connected_controller_uses_the_selected_layout() {
+        let f = KeyState {
+            virtual_key: b'F',
+            ..Default::default()
+        };
+        for (pc_controls, expected) in [(true, Y), (false, LEFT_STICK)] {
+            let host_pad = PadState {
+                buttons: key_button(b'F', pc_controls),
+                ..Default::default()
+            };
+            let stand_in = keyboard_layout(&[f], pc_controls);
+            assert_eq!(merged(host_pad, stand_in).buttons, expected);
+        }
+    }
 
     #[test]
     fn pc_actions_and_mouse_combine_with_keyboard_axes() {
@@ -287,25 +361,39 @@ mod tests {
     fn packets_accumulate_between_polls_and_releases_clear_buttons() {
         let mut motion = Motion::default();
         let now = Instant::now();
-        motion.sample(now);
+        motion.sample(now, true);
         motion.packet(4, -3, wm::RI_MOUSE_RIGHT_BUTTON_DOWN);
         motion.packet(5, -6, wm::RI_MOUSE_LEFT_BUTTON_DOWN);
-        let p = motion.sample(now + std::time::Duration::from_millis(20));
+        let p = motion.sample(now + std::time::Duration::from_millis(20), true);
         assert_eq!(
             (p.right_x, p.right_y, p.left_trigger, p.right_trigger),
             (0.5, 0.5, 1.0, 1.0)
         );
         motion.packet(0, 0, wm::RI_MOUSE_LEFT_BUTTON_UP);
-        let p = motion.sample(now + std::time::Duration::from_millis(40));
+        let p = motion.sample(now + std::time::Duration::from_millis(40), true);
         assert_eq!(
             (p.right_x, p.right_y, p.left_trigger, p.right_trigger),
             (0., 0., 1., 0.)
         );
         motion.packet(0, 0, wm::RI_MOUSE_RIGHT_BUTTON_UP);
         assert_eq!(
-            motion.sample(now + std::time::Duration::from_millis(60)),
+            motion.sample(now + std::time::Duration::from_millis(60), true),
             PadState::default()
         );
+    }
+
+    #[test]
+    fn reconnecting_the_stand_in_discards_motion_while_it_was_unavailable() {
+        let mut motion = Motion::default();
+        let now = Instant::now();
+        motion.sample(now, true);
+        motion.packet(200, 90, wm::RI_MOUSE_LEFT_BUTTON_DOWN);
+        assert_eq!(motion.sample(now, false), PadState::default());
+        motion.packet(80, 45, wm::RI_MOUSE_LEFT_BUTTON_UP);
+        assert_eq!(motion.sample(now, true), PadState::default());
+        motion.packet(9, 0, 0);
+        let resumed = motion.sample(now + std::time::Duration::from_millis(20), true);
+        assert_eq!((resumed.right_x, resumed.right_y), (0.5, 0.0));
     }
 
     #[test]

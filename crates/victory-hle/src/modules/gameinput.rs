@@ -121,7 +121,30 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
+/// Map a physical or scripted virtual key through the selected keyboard layout.
+fn key_button(vk: u8, pc_controls: bool) -> u32 {
+    if pc_controls {
+        match vk {
+            b'F' => return Y,
+            b'E' => return RIGHT,            // Context action
+            b'R' => return B,                // Reload / melee
+            b'Q' => return RIGHT_SHOULDER,   // Cover
+            0x09 => return LEFT_SHOULDER,    // Tab: weapon wheel
+            b'V' => return VIEW,             // Camera view
+            0x20 => return X,                 // Space
+            0xa0 | 0xa1 => return A,          // Left/right Shift
+            b'C' | 0xa2 | 0xa3 => return LEFT_STICK, // C or Ctrl: crouch
+            _ => {}
+        }
+    }
+    FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk).map_or(0, |(_, bit)| *bit)
+}
+
 fn fallback(keys: &[KeyState]) -> PadState {
+    keyboard_layout(keys, false)
+}
+
+fn keyboard_layout(keys: &[KeyState], pc_controls: bool) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
@@ -130,12 +153,9 @@ fn fallback(keys: &[KeyState]) -> PadState {
         }
     };
     PadState {
-        buttons: FALLBACK_BUTTONS
-            .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
+        buttons: keys.iter().fold(0, |all, key| all | key_button(key.virtual_key, pc_controls)),
+        left_trigger: if pc_controls { 0.0 } else { on(b'Z') },
+        right_trigger: if pc_controls { 0.0 } else { on(b'C') },
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
         right_x: on(b'L') - on(b'J'),
@@ -1209,9 +1229,7 @@ mod host {
             // to the pad (the title's start screen) saw nothing.
             if slot == 0 {
                 for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
+                    pad.buttons |= super::key_button(vk, pc::enabled());
                 }
             }
             Some(pad)
@@ -1243,12 +1261,7 @@ mod host {
 
         fn keyboard_pad(&mut self, keys: &[KeyState], available: bool) -> PadState {
             if pc::enabled() {
-                let window = if available {
-                    focused_window()
-                } else {
-                    std::ptr::null_mut()
-                };
-                pc::pad(keys, pc::mouse_pad(window))
+                pc::pad(keys, pc::mouse_pad(focused_window(), available))
             } else {
                 fallback(keys)
             }

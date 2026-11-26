@@ -9785,14 +9785,53 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     Ok(HWND(hwnd as *mut _))
 }
 
+type InputMessage = fn(windows_sys::Win32::Foundation::HWND, u32, usize, isize) -> Option<isize>;
+
+static WINDOW_INPUT: OnceLock<InputMessage> = OnceLock::new();
+
+/// Routes input from the GPU-owned fallback window to the same handler as the title window.
+pub fn on_window_input(handler: InputMessage) {
+    let _ = WINDOW_INPUT.set(handler);
+}
+
 extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if let Some(handler) = WINDOW_INPUT.get()
+        && let Some(result) = handler(hwnd.0, message, wparam.0, lparam.0)
+    {
+        return LRESULT(result);
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+#[cfg(test)]
+#[test]
+fn fallback_window_routes_input_and_forwards_unhandled_messages() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F6;
+
+    fn input(
+        hwnd: windows_sys::Win32::Foundation::HWND,
+        message: u32,
+        w: usize,
+        l: isize,
+    ) -> Option<isize> {
+        // Only handle the synthetic calls made by this test.
+        (hwnd.is_null() && w == usize::from(VK_F6) && l == 123 && matches!(message, WM_KEYDOWN | WM_INPUT))
+            .then_some(42)
+    }
+    on_window_input(input);
+    let (hwnd, w, l) = (HWND::default(), WPARAM(usize::from(VK_F6)), LPARAM(123));
+    for message in [WM_KEYDOWN, WM_INPUT] {
+        assert_eq!(window_proc(hwnd, message, w, l), LRESULT(42));
+    }
+    // SAFETY: compares the harmless WM_NULL default for the same arguments.
+    let expected = unsafe { DefWindowProcW(hwnd, WM_NULL, w, l) };
+    assert_eq!(window_proc(hwnd, WM_NULL, w, l), expected);
 }
 
 fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {

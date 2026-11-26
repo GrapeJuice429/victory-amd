@@ -24,15 +24,25 @@ or publisher.
 
 ### PC controls
 
-Set `VICTORY_PC_CONTROLS=1` to enable keyboard and mouse controls. Press
-**F6** inside the game to capture the mouse for camera movement. F6 releases
-it again, and changing focus releases it automatically. Right mouse holds
-LT (aim or brake) and left mouse holds RT (fire or accelerate). WASD moves,
-Shift presses A (sprint), Space presses X (jump), F presses Y (enter/exit),
-and Ctrl clicks the left stick. Enter confirms, Backspace backs out, Esc
-pauses, Tab opens View, and the arrow keys operate the D-pad. The game still
-shows controller prompts. The default unified pad accepts a physical
-controller alongside these bindings.
+When launching with `scripts\play.ps1`, add `-More @{VICTORY_PC_CONTROLS='1'}`
+to the command. When running `victory.exe` directly, set the environment
+variable `VICTORY_PC_CONTROLS=1`. Click the game window to capture the mouse
+for camera movement. F6 toggles capture and Alt+Tab releases it.
+
+| Action | PC input | Controller input |
+| --- | --- | --- |
+| Move and look | WASD and mouse | Left and right sticks |
+| Aim and fire | Right and left mouse | LT and RT |
+| Sprint, jump, crouch | Shift, Space, Ctrl or C | A, X, left stick click |
+| Interact, enter or exit a vehicle | E, F | D-pad right, Y |
+| Reload or melee, take cover | R, Q | B, RB |
+| Weapon wheel, change view | Hold Tab, V | LB, View |
+| Pause, confirm, back, navigate | Esc, Enter, Backspace, arrow keys | Menu, A, B, D-pad |
+
+F7 toggles the driving layout. W accelerates (RT), S brakes or reverses (LT),
+A/D steer, and Space applies the handbrake (RB). Press F7 again when back on
+foot. The title shows controller prompts and assigns some actions by context.
+The default unified pad accepts a physical controller alongside these bindings.
 
 ## Where it stands (2026-11-25)
 
