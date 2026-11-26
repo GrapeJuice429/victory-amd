@@ -21,6 +21,9 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+#[cfg(windows)]
+pub(super) mod pc;
+
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
@@ -111,6 +114,9 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    fn keyboard_pad(&mut self, keys: &[KeyState], _available: bool) -> PadState {
+        fallback(keys)
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -430,12 +436,15 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, keyboard_pad) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let keys = source.keys();
+            let available = self.one_pad || pads.iter().all(Option::is_none);
+            let keyboard_pad = source.keyboard_pad(&keys, available);
+            (pads, keys, keyboard_pad)
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, keyboard_pad);
         self.deliver(events);
     }
 
@@ -481,11 +490,12 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        keyboard_pad: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(keyboard_pad, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -494,7 +504,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then_some(Value::Pad(keyboard_pad));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1209,7 +1219,7 @@ mod host {
 
         fn keys(&mut self) -> Vec<KeyState> {
             let mut down = scripted();
-            if focused() {
+            if !focused_window().is_null() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
@@ -1229,6 +1239,19 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        fn keyboard_pad(&mut self, keys: &[KeyState], available: bool) -> PadState {
+            if pc::enabled() {
+                let window = if available {
+                    focused_window()
+                } else {
+                    std::ptr::null_mut()
+                };
+                pc::pad(keys, pc::mouse_pad(window))
+            } else {
+                fallback(keys)
+            }
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1283,12 +1306,17 @@ mod host {
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
-    fn focused() -> bool {
+    fn focused_window() -> windows_sys::Win32::Foundation::HWND {
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
         unsafe {
-            GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
-            process == GetCurrentProcessId()
+            let hwnd = GetForegroundWindow();
+            GetWindowThreadProcessId(hwnd, &mut process);
+            if process == GetCurrentProcessId() {
+                hwnd
+            } else {
+                std::ptr::null_mut()
+            }
         }
     }
 

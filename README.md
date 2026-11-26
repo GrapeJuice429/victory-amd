@@ -22,6 +22,18 @@ one PC, without giving up the picture. It is not there yet.
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
+### PC controls
+
+Set `VICTORY_PC_CONTROLS=1` to enable keyboard and mouse controls. Press
+**F6** inside the game to capture the mouse for camera movement. F6 releases
+it again, and changing focus releases it automatically. Right mouse holds
+LT (aim or brake) and left mouse holds RT (fire or accelerate). WASD moves,
+Shift presses A (sprint), Space presses X (jump), F presses Y (enter/exit),
+and Ctrl clicks the left stick. Enter confirms, Backspace backs out, Esc
+pauses, Tab opens View, and the arrow keys operate the D-pad. The game still
+shows controller prompts. The default unified pad accepts a physical
+controller alongside these bindings.
+
 ## Where it stands (2026-11-25)
 
 Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
